@@ -10,19 +10,48 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torchvision import models
 
 
 class ThermalCNN(nn.Module):
-    """Lightweight CNN designed for thermal skin lesion classification."""
+    """Lightweight CNN designed for thermal skin lesion classification.
 
-    def __init__(self, num_classes: int, in_channels: int = 3) -> None:
+    Architecture: three conv blocks (conv→BN→ReLU→MaxPool) followed by
+    a two-layer MLP classifier with dropout.
+    """
+
+    def __init__(self, num_classes: int, in_channels: int = 1) -> None:
         """
         Args:
             num_classes: Number of output classes.
             in_channels: Number of input channels (1 for grayscale, 3 for RGB).
         """
         super().__init__()
-        raise NotImplementedError
+        self.features = nn.Sequential(
+            # Block 1: (B, in_channels, 224, 224) → (B, 32, 112, 112)
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            # Block 2: → (B, 64, 56, 56)
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            # Block 3: → (B, 128, 28, 28)
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(128, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -33,7 +62,25 @@ class ThermalCNN(nn.Module):
         Returns:
             Logits tensor of shape (B, num_classes).
         """
-        raise NotImplementedError
+        x = self.features(x)
+        return self.classifier(x)
+
+    def extract_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        """Return penultimate-layer embeddings (before final linear).
+
+        Used for classical ML feature extraction (SVM / Random Forest).
+
+        Args:
+            x: Input tensor of shape (B, C, H, W).
+
+        Returns:
+            Embedding tensor of shape (B, 256).
+        """
+        x = self.features(x)
+        # Run classifier up to (but not including) the last Linear
+        for layer in list(self.classifier.children())[:-1]:
+            x = layer(x)
+        return x
 
 
 def build_transfer_model(
@@ -44,8 +91,11 @@ def build_transfer_model(
 ) -> nn.Module:
     """Build a transfer-learning model from a torchvision backbone.
 
+    The first conv layer is adapted to accept single-channel input by
+    averaging the pre-trained RGB weights across the channel dimension.
+
     Args:
-        backbone: Name of the torchvision model (e.g. 'resnet18', 'efficientnet_b0').
+        backbone: Name of the torchvision model ('resnet18', 'efficientnet_b0').
         num_classes: Number of output classes.
         pretrained: Whether to load ImageNet pre-trained weights.
         freeze_backbone: If True, freeze all layers except the final classifier.
@@ -53,7 +103,40 @@ def build_transfer_model(
     Returns:
         A PyTorch model with a replaced classification head.
     """
-    raise NotImplementedError
+    weights_arg = "DEFAULT" if pretrained else None
+
+    if backbone == "resnet18":
+        model = models.resnet18(weights=weights_arg)
+        # Adapt first conv: (64, 3, 7, 7) → (64, 1, 7, 7)
+        old_conv = model.conv1
+        new_conv = nn.Conv2d(1, old_conv.out_channels, kernel_size=old_conv.kernel_size,
+                             stride=old_conv.stride, padding=old_conv.padding, bias=False)
+        if pretrained:
+            new_conv.weight.data = old_conv.weight.data.mean(dim=1, keepdim=True)
+        model.conv1 = new_conv
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+
+    elif backbone == "efficientnet_b0":
+        model = models.efficientnet_b0(weights=weights_arg)
+        old_conv = model.features[0][0]
+        new_conv = nn.Conv2d(1, old_conv.out_channels, kernel_size=old_conv.kernel_size,
+                             stride=old_conv.stride, padding=old_conv.padding, bias=False)
+        if pretrained:
+            new_conv.weight.data = old_conv.weight.data.mean(dim=1, keepdim=True)
+        model.features[0][0] = new_conv
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(in_features, num_classes)
+
+    else:
+        raise ValueError(f"Unsupported backbone: {backbone!r}. Use 'resnet18' or 'efficientnet_b0'.")
+
+    if freeze_backbone:
+        for name, param in model.named_parameters():
+            # Unfreeze only the final classifier
+            if "fc" not in name and "classifier" not in name:
+                param.requires_grad = False
+
+    return model
 
 
 def train_one_epoch(
@@ -62,20 +145,42 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-) -> float:
-    """Run one training epoch and return the average loss.
+) -> tuple[float, float]:
+    """Run one training epoch and return the average loss and accuracy.
+
+    Accuracy is computed from the same forward pass used for the loss,
+    avoiding a redundant pass over the training set.
 
     Args:
         model: The model to train.
         loader: Training DataLoader.
         optimizer: Optimizer instance.
         criterion: Loss function.
-        device: Target device (CPU or CUDA).
+        device: Target device (CPU, CUDA, or MPS).
 
     Returns:
-        Average training loss over the epoch.
+        Tuple of (average training loss, training accuracy).
     """
-    raise NotImplementedError
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * images.size(0)
+        correct += (logits.argmax(dim=1) == labels).sum().item()
+        total += labels.size(0)
+
+    return total_loss / len(loader.dataset), correct / total
 
 
 def evaluate_model(
@@ -93,7 +198,27 @@ def evaluate_model(
     Returns:
         Tuple of (accuracy, true_labels, predicted_labels).
     """
-    raise NotImplementedError
+    model.eval()
+    correct = 0
+    total = 0
+    all_true: list[int] = []
+    all_pred: list[int] = []
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            logits = model(images)
+            preds = logits.argmax(dim=1)
+
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            all_true.extend(labels.cpu().tolist())
+            all_pred.extend(preds.cpu().tolist())
+
+    accuracy = correct / total
+    return accuracy, all_true, all_pred
 
 
 def save_checkpoint(
@@ -110,4 +235,10 @@ def save_checkpoint(
         epoch: Current epoch number (stored in checkpoint metadata).
         optimizer: Optional optimizer state to include.
     """
-    raise NotImplementedError
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+    }
+    if optimizer is not None:
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+    torch.save(checkpoint, path)
