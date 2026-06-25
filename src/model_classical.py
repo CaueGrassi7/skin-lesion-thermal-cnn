@@ -1,44 +1,53 @@
 """
 Classical machine learning classifiers for thermal skin lesion images.
 
-Implements SVM and Random Forest pipelines using hand-crafted features
-(HOG, LBP) or CNN-extracted embeddings as input representations.
+Feature strategy: CNN-extracted embeddings from ThermalCNN's penultimate layer
+(dim=256), which are methodologically stronger than hand-crafted HOG/LBP features
+and align with the reference literature (Magalhães et al. 2021).
 """
 
 from typing import Any
 
 import numpy as np
+import torch
+import torch.nn as nn
 from sklearn.base import ClassifierMixin
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from torch.utils.data import DataLoader
 
 
-def extract_hog_features(images: np.ndarray) -> np.ndarray:
-    """Extract Histogram of Oriented Gradients (HOG) features from images.
-
-    Args:
-        images: Array of images with shape (N, H, W) or (N, H, W, C).
-
-    Returns:
-        Feature matrix of shape (N, feature_dim).
-    """
-    raise NotImplementedError
-
-
-def extract_lbp_features(images: np.ndarray, radius: int = 1, n_points: int = 8) -> np.ndarray:
-    """Extract Local Binary Pattern (LBP) texture features from images.
+def extract_cnn_embeddings(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract penultimate-layer embeddings from a trained CNN.
 
     Args:
-        images: Array of grayscale images with shape (N, H, W).
-        radius: Radius of the circular LBP neighbourhood.
-        n_points: Number of circularly symmetric neighbour set points.
+        model: Trained ThermalCNN with an extract_embeddings() method.
+        loader: DataLoader to extract features from (train, val, or test).
+        device: Target device (CPU, CUDA, or MPS).
 
     Returns:
-        Feature matrix of shape (N, n_points + 2).
+        Tuple of (embeddings of shape (N, embed_dim), labels of shape (N,)).
     """
-    raise NotImplementedError
+    model.eval()
+    all_embeddings: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            embeddings = model.extract_embeddings(images)
+            all_embeddings.append(embeddings.cpu().numpy())
+            all_labels.append(labels.numpy())
+
+    return np.concatenate(all_embeddings, axis=0), np.concatenate(all_labels, axis=0)
 
 
 def build_svm(kernel: str = "rbf", C: float = 1.0, **kwargs: Any) -> ClassifierMixin:
-    """Build a scikit-learn SVM classifier.
+    """Build a scikit-learn SVM classifier with probability estimates enabled.
 
     Args:
         kernel: SVM kernel type ('linear', 'rbf', 'poly').
@@ -48,7 +57,7 @@ def build_svm(kernel: str = "rbf", C: float = 1.0, **kwargs: Any) -> ClassifierM
     Returns:
         An unfitted sklearn SVC instance.
     """
-    raise NotImplementedError
+    return SVC(kernel=kernel, C=C, probability=True, random_state=42, **kwargs)
 
 
 def build_random_forest(
@@ -66,7 +75,13 @@ def build_random_forest(
     Returns:
         An unfitted sklearn RandomForestClassifier instance.
     """
-    raise NotImplementedError
+    return RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=42,
+        n_jobs=-1,
+        **kwargs,
+    )
 
 
 def train_classical(
@@ -78,26 +93,28 @@ def train_classical(
 
     Args:
         classifier: An unfitted sklearn classifier.
-        X_train: Training feature matrix of shape (N, feature_dim).
+        X_train: Training feature matrix of shape (N, embed_dim).
         y_train: Training labels of shape (N,).
 
     Returns:
         The fitted classifier.
     """
-    raise NotImplementedError
+    return classifier.fit(X_train, y_train)
 
 
 def predict_classical(
     classifier: ClassifierMixin,
     X: np.ndarray,
-) -> np.ndarray:
-    """Generate predictions from a fitted classical classifier.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate predictions and probability scores from a fitted classifier.
 
     Args:
-        classifier: A fitted sklearn classifier.
-        X: Feature matrix of shape (N, feature_dim).
+        classifier: A fitted sklearn classifier with predict_proba support.
+        X: Feature matrix of shape (N, embed_dim).
 
     Returns:
-        Predicted label array of shape (N,).
+        Tuple of (predicted labels of shape (N,), probability scores of shape (N, C)).
     """
-    raise NotImplementedError
+    y_pred = classifier.predict(X)
+    y_prob = classifier.predict_proba(X)
+    return y_pred, y_prob
