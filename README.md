@@ -13,7 +13,7 @@ skin-lesion-thermal-cnn/
 ├── notebooks/
 │   ├── 01_exploratory_analysis.ipynb
 │   ├── 02_preprocessing.ipynb
-│   └── 03_training_and_evaluation.ipynb
+│   └── 03_evaluation.ipynb
 ├── src/
 │   ├── __init__.py
 │   ├── dataset.py       # Dataset loading and augmentation

@@ -72,6 +72,47 @@ def compute_metrics(
     return metrics
 
 
+def aggregate_by_group(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    group_ids: list,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Aggregate frame-level predictions into one prediction per group.
+
+    Averages predicted probabilities across all frames sharing the same
+    group id (e.g. patient_id + class, since a single patient may contribute
+    frames to both classes — see `_patient_kfold_split`) and takes the argmax
+    as the group-level prediction. Reduces the noise of individual frames,
+    which are highly correlated within a thermal sequence.
+
+    Args:
+        y_true: Ground-truth label array of shape (N,), one entry per frame.
+        y_prob: Predicted probability array of shape (N, C).
+        group_ids: Sequence of length N identifying which group each frame
+            belongs to (frames sharing an id are averaged together).
+
+    Returns:
+        Tuple of (y_true_agg, y_pred_agg, y_prob_agg), one row per group, in
+        order of first appearance of each group id.
+    """
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    group_ids = np.asarray(group_ids)
+
+    unique_groups = list(dict.fromkeys(group_ids.tolist()))
+    true_agg = []
+    prob_agg = []
+    for g in unique_groups:
+        mask = group_ids == g
+        true_agg.append(y_true[mask][0])
+        prob_agg.append(y_prob[mask].mean(axis=0))
+
+    y_true_agg = np.array(true_agg)
+    y_prob_agg = np.array(prob_agg)
+    y_pred_agg = y_prob_agg.argmax(axis=1)
+    return y_true_agg, y_pred_agg, y_prob_agg
+
+
 def plot_confusion_matrix(
     y_true: np.ndarray,
     y_pred: np.ndarray,

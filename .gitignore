@@ -30,6 +30,15 @@ results/*.png
 results/*.csv
 results/*.json
 
+# results/runs/<run-name>/ — regenerable per-run artifacts (rerun scripts/train_cv.py
+# to reproduce). RUN.md is intentionally NOT ignored: it's the human-written record
+# of what changed for that run and is meant to stay in git history.
+results/runs/*/*.png
+results/runs/*/*.csv
+results/runs/*/*.json
+results/runs/*/*.npz
+results/runs/*/*.log
+
 # Docs
 docs/
 
