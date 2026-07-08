@@ -56,7 +56,9 @@ from src.model_cnn import (
 logger = logging.getLogger(__name__)
 
 MODEL_NAMES = ["ThermalCNN", "ResNet18", "SVM", "Random Forest"]
-FILE_SLUG = {"ThermalCNN": "thermal_cnn", "ResNet18": "resnet18", "SVM": "svm", "Random Forest": "rf"}
+FILE_SLUG = {
+    "ThermalCNN": "thermal_cnn", "ResNet18": "resnet18", "SVM": "svm", "Random Forest": "rf",
+}
 
 
 @dataclass
@@ -86,6 +88,7 @@ class TrainConfig:
     seed: int = 42
 
     def to_json_dict(self) -> dict:
+        """Serialize to a JSON-safe dict (Path fields as strings)."""
         d = asdict(self)
         d["data_root"] = str(self.data_root)
         d["results_dir"] = str(self.results_dir)
@@ -165,7 +168,7 @@ def _training_loop(
 
     for epoch in range(1, num_epochs + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_acc, val_true, val_pred = evaluate_model(model, val_loader, device)
+        val_acc, val_true, _ = evaluate_model(model, val_loader, device)
 
         model.eval()
         val_loss = 0.0
@@ -179,8 +182,12 @@ def _training_loop(
         val_loss /= len(val_loader.dataset)
 
         if val_group_ids is not None:
-            val_prob_2col = np.stack([1 - np.array(val_probs), np.array(val_probs)], axis=1)
-            val_true_agg, _, val_prob_agg = aggregate_by_group(val_true, val_prob_2col, val_group_ids)
+            val_prob_2col = np.stack(
+                [1 - np.array(val_probs), np.array(val_probs)], axis=1,
+            )
+            val_true_agg, _, val_prob_agg = aggregate_by_group(
+                val_true, val_prob_2col, val_group_ids,
+            )
             val_auc = roc_auc_score(val_true_agg, val_prob_agg[:, 1])
         else:
             val_auc = roc_auc_score(val_true, val_probs)
@@ -196,10 +203,10 @@ def _training_loop(
         improved = val_auc > best_val_auc
         marker = " *" if improved else ""
         logger.info(
-            f"[{model_name}] epoca {epoch:02d}/{num_epochs} | "
-            f"loss treino={train_loss:.4f} val={val_loss:.4f} | "
-            f"acc treino={train_acc:.4f} val={val_acc:.4f} | "
-            f"auc val={val_auc:.4f}{marker}"
+            "[%s] epoca %02d/%d | loss treino=%.4f val=%.4f | "
+            "acc treino=%.4f val=%.4f | auc val=%.4f%s",
+            model_name, epoch, num_epochs, train_loss, val_loss,
+            train_acc, val_acc, val_auc, marker,
         )
 
         if improved:
@@ -211,7 +218,9 @@ def _training_loop(
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                logger.info(f"  -> Early stopping na epoca {epoch} (sem melhora ha {patience} epocas)")
+                logger.info(
+                    "  -> Early stopping na epoca %d (sem melhora ha %d epocas)", epoch, patience,
+                )
                 break
 
     if best_state is not None:
@@ -220,7 +229,9 @@ def _training_loop(
     return model, history
 
 
-def _predict_probs(model: nn.Module, loader, device: torch.device) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _predict_probs(
+    model: nn.Module, loader, device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (y_true, y_pred, y_prob) for every sample in `loader`."""
     model.eval()
     all_true, all_pred, all_prob = [], [], []
@@ -236,7 +247,9 @@ def _predict_probs(model: nn.Module, loader, device: torch.device) -> tuple[np.n
     return np.array(all_true), np.array(all_pred), np.array(all_prob)
 
 
-def _temporal_feature_matrix(fold_samples: list[dict], temporal_features: dict[str, np.ndarray]) -> np.ndarray:
+def _temporal_feature_matrix(
+    fold_samples: list[dict], temporal_features: dict[str, np.ndarray],
+) -> np.ndarray:
     """Map each sample in `fold_samples` (same order) to its sequence's
     precomputed thermal-dynamics feature vector (patient_id + label)."""
     keys = [f"{s['patient_id']}_{s['label']}" for s in fold_samples]
@@ -284,9 +297,14 @@ def _train_and_evaluate_fold(
     predictions: dict = {}
 
     def record(model_name, y_true, y_pred, y_prob):
-        results.append({"fold": fold_idx, "model": model_name, **compute_metrics(y_true, y_pred, y_prob)})
+        results.append({
+            "fold": fold_idx, "model": model_name, **compute_metrics(y_true, y_pred, y_prob),
+        })
         seq_true, seq_pred, seq_prob = aggregate_by_group(y_true, y_prob, test_seq_ids)
-        results_seq.append({"fold": fold_idx, "model": model_name, **compute_metrics(seq_true, seq_pred, seq_prob)})
+        results_seq.append({
+            "fold": fold_idx, "model": model_name,
+            **compute_metrics(seq_true, seq_pred, seq_prob),
+        })
         predictions[model_name] = (y_true, y_pred, y_prob)
 
     # --- ThermalCNN ---
@@ -303,7 +321,9 @@ def _train_and_evaluate_fold(
     record("ThermalCNN", cnn_true, cnn_pred, cnn_prob)
 
     # --- ResNet18 (phase 1: frozen backbone, phase 2: full fine-tuning) ---
-    resnet_model = build_transfer_model("resnet18", num_classes=config.num_classes, pretrained=True, freeze_backbone=True)
+    resnet_model = build_transfer_model(
+        "resnet18", num_classes=config.num_classes, pretrained=True, freeze_backbone=True,
+    )
     resnet_model, _ = _training_loop(
         resnet_model, train_loader, val_loader, device,
         model_name=f"ResNet18-fase1[fold {fold_idx}]",
@@ -373,16 +393,20 @@ def _train_and_evaluate_fold(
     rf_pred, rf_prob = predict_classical(rf, X_test_full, n_classes=config.num_classes)
     record("Random Forest", y_test_emb, rf_pred, rf_prob)
 
-    logger.info(f"--- Fold {fold_idx} concluido ---")
+    logger.info("--- Fold %d concluido ---", fold_idx)
     for r, r_seq in zip(results, results_seq):
         auc = r.get("auc_roc", float("nan"))
         auc_seq = r_seq.get("auc_roc", float("nan"))
         logger.info(
-            f"  {r['model']:<15} frame: acc={r['accuracy']:.4f} f1={r['f1']:.4f} auc={auc:.4f}"
-            f"  |  paciente: acc={r_seq['accuracy']:.4f} f1={r_seq['f1']:.4f} auc={auc_seq:.4f}"
+            "  %-15s frame: acc=%.4f f1=%.4f auc=%.4f  |  paciente: acc=%.4f f1=%.4f auc=%.4f",
+            r["model"], r["accuracy"], r["f1"], auc,
+            r_seq["accuracy"], r_seq["f1"], auc_seq,
         )
 
-    return results, results_seq, predictions, {"ThermalCNN": cnn_history, "ResNet18": resnet_history}
+    return (
+        results, results_seq, predictions,
+        {"ThermalCNN": cnn_history, "ResNet18": resnet_history},
+    )
 
 
 def _save_outputs(
@@ -414,13 +438,14 @@ def _save_outputs(
         )
 
     for model_name, history in fold0_histories.items():
-        with open(results_dir / f"history_{FILE_SLUG[model_name]}_fold0.json", "w") as f:
+        history_path = results_dir / f"history_{FILE_SLUG[model_name]}_fold0.json"
+        with open(history_path, "w", encoding="utf-8") as f:
             json.dump(history, f)
 
-    with open(results_dir / "train_config.json", "w") as f:
+    with open(results_dir / "train_config.json", "w", encoding="utf-8") as f:
         json.dump(config.to_json_dict(), f, indent=2)
 
-    logger.info(f"Metricas, predicoes e historico salvos em {results_dir}")
+    logger.info("Metricas, predicoes e historico salvos em %s", results_dir)
 
 
 def run_cross_validation(config: TrainConfig, device: torch.device) -> None:
@@ -428,7 +453,9 @@ def run_cross_validation(config: TrainConfig, device: torch.device) -> None:
     all outputs under `config.results_dir`."""
     config.results_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Coletando amostras de {config.data_root} (frame_stride={config.frame_stride})...")
+    logger.info(
+        "Coletando amostras de %s (frame_stride=%d)...", config.data_root, config.frame_stride,
+    )
     samples = _collect_samples(config.data_root, frame_stride=config.frame_stride)
     folds = _patient_kfold_split(samples, k=config.k_folds, seed=config.seed)
 
@@ -439,16 +466,17 @@ def run_cross_validation(config: TrainConfig, device: torch.device) -> None:
     temporal_features = compute_temporal_features(samples)
 
     logger.info(
-        f"Total de amostras: {len(samples):,} | "
-        f"sequencias com features de dinamica termica: {len(temporal_features):,}"
+        "Total de amostras: %s | sequencias com features de dinamica termica: %s",
+        f"{len(samples):,}", f"{len(temporal_features):,}",
     )
     for i, f in enumerate(folds):
         n_train_p = len(set(s["patient_id"] for s in f["train"]))
         n_val_p = len(set(s["patient_id"] for s in f["val"]))
         n_test_p = len(set(s["patient_id"] for s in f["test"]))
         logger.info(
-            f"Fold {i}: train={len(f['train']):,} ({n_train_p}p) "
-            f"val={len(f['val']):,} ({n_val_p}p) test={len(f['test']):,} ({n_test_p}p)"
+            "Fold %d: train=%s (%dp) val=%s (%dp) test=%s (%dp)",
+            i, f"{len(f['train']):,}", n_train_p,
+            f"{len(f['val']):,}", n_val_p, f"{len(f['test']):,}", n_test_p,
         )
 
     all_results: list[dict] = []
@@ -457,7 +485,7 @@ def run_cross_validation(config: TrainConfig, device: torch.device) -> None:
     fold0_histories: dict = {}
 
     for i, fold in enumerate(folds):
-        logger.info(f"{'=' * 70}\nFOLD {i + 1}/{config.k_folds}\n{'=' * 70}")
+        logger.info("%s\nFOLD %d/%d\n%s", "=" * 70, i + 1, config.k_folds, "=" * 70)
         results, results_seq, predictions, histories = _train_and_evaluate_fold(
             fold, i, config, device, temporal_features,
         )

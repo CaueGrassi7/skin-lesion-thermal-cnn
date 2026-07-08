@@ -131,7 +131,9 @@ def build_transfer_model(
         model.classifier[1] = nn.Linear(in_features, num_classes)
 
     else:
-        raise ValueError(f"Unsupported backbone: {backbone!r}. Use 'resnet18' or 'efficientnet_b0'.")
+        raise ValueError(
+            f"Unsupported backbone: {backbone!r}. Use 'resnet18' or 'efficientnet_b0'."
+        )
 
     if freeze_backbone:
         for name, param in model.named_parameters():

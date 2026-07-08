@@ -155,7 +155,10 @@ def _patient_kfold_split(
     rng = np.random.default_rng(seed)
     patient_ids = list(patient_class_counts)
     rng.shuffle(patient_ids)
-    patient_ids.sort(key=lambda pid: patient_class_counts[pid][0] - patient_class_counts[pid][1], reverse=True)
+    patient_ids.sort(
+        key=lambda pid: patient_class_counts[pid][0] - patient_class_counts[pid][1],
+        reverse=True,
+    )
 
     snake_order = list(range(k)) + list(range(k - 1, -1, -1))
     patient_fold = {
