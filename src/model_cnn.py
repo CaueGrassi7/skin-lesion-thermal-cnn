@@ -86,22 +86,46 @@ class ThermalCNN(nn.Module):
         return x
 
 
+def _adapt_first_conv(old_conv: nn.Conv2d, in_channels: int, pretrained: bool) -> nn.Conv2d:
+    """Return a copy of `old_conv` accepting `in_channels` input channels.
+
+    The pre-trained RGB filters are averaged across the channel dimension to a
+    single-channel filter, then that filter is replicated across all
+    `in_channels` inputs (so a multi-frame temporal stack starts from the same
+    pre-trained edge/texture detectors on every channel). This preserves the
+    ImageNet features while matching the dataset's single-channel frames — or,
+    for temporal input, a stack of them (see `TemporalThermalDataset`).
+    """
+    new_conv = nn.Conv2d(
+        in_channels, old_conv.out_channels, kernel_size=old_conv.kernel_size,
+        stride=old_conv.stride, padding=old_conv.padding, bias=old_conv.bias is not None,
+    )
+    if pretrained:
+        mean_filter = old_conv.weight.data.mean(dim=1, keepdim=True)  # (out, 1, kh, kw)
+        new_conv.weight.data = mean_filter.repeat(1, in_channels, 1, 1)
+    return new_conv
+
+
 def build_transfer_model(
     backbone: str,
     num_classes: int,
     pretrained: bool = True,
     freeze_backbone: bool = False,
+    in_channels: int = 1,
 ) -> nn.Module:
     """Build a transfer-learning model from a torchvision backbone.
 
-    The first conv layer is adapted to accept single-channel input by
-    averaging the pre-trained RGB weights across the channel dimension.
+    The first conv layer is adapted to accept `in_channels` input channels by
+    averaging the pre-trained RGB weights across the channel dimension and
+    replicating the result (see `_adapt_first_conv`).
 
     Args:
         backbone: Name of the torchvision model ('resnet18', 'efficientnet_b0').
         num_classes: Number of output classes.
         pretrained: Whether to load ImageNet pre-trained weights.
         freeze_backbone: If True, freeze all layers except the final classifier.
+        in_channels: Number of input channels (1 for a single grayscale frame,
+            >1 for a temporal multi-frame stack).
 
     Returns:
         A PyTorch model with a replaced classification head.
@@ -110,23 +134,13 @@ def build_transfer_model(
 
     if backbone == "resnet18":
         model = models.resnet18(weights=weights_arg)
-        # Adapt first conv: (64, 3, 7, 7) → (64, 1, 7, 7)
-        old_conv = model.conv1
-        new_conv = nn.Conv2d(1, old_conv.out_channels, kernel_size=old_conv.kernel_size,
-                             stride=old_conv.stride, padding=old_conv.padding, bias=False)
-        if pretrained:
-            new_conv.weight.data = old_conv.weight.data.mean(dim=1, keepdim=True)
-        model.conv1 = new_conv
+        # Adapt first conv: (64, 3, 7, 7) → (64, in_channels, 7, 7)
+        model.conv1 = _adapt_first_conv(model.conv1, in_channels, pretrained)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
 
     elif backbone == "efficientnet_b0":
         model = models.efficientnet_b0(weights=weights_arg)
-        old_conv = model.features[0][0]
-        new_conv = nn.Conv2d(1, old_conv.out_channels, kernel_size=old_conv.kernel_size,
-                             stride=old_conv.stride, padding=old_conv.padding, bias=False)
-        if pretrained:
-            new_conv.weight.data = old_conv.weight.data.mean(dim=1, keepdim=True)
-        model.features[0][0] = new_conv
+        model.features[0][0] = _adapt_first_conv(model.features[0][0], in_channels, pretrained)
         in_features = model.classifier[1].in_features
         model.classifier[1] = nn.Linear(in_features, num_classes)
 

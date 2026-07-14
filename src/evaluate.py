@@ -113,6 +113,41 @@ def aggregate_by_group(
     return y_true_agg, y_pred_agg, y_prob_agg
 
 
+def best_threshold(
+    y_true: np.ndarray,
+    prob_pos: np.ndarray,
+    default: float = 0.5,
+) -> float:
+    """Pick the decision threshold on `prob_pos` maximizing Youden's J (tpr - fpr).
+
+    A fixed 0.5 argmax can badly misplace the operating point when the two
+    classes' score distributions overlap or shift — some folds produce
+    well-ranked probabilities (AUC ~0.65) yet collapse to near-zero
+    specificity at 0.5. Tuning the threshold on a held-out (validation) split
+    and applying it to test recovers a balanced operating point without
+    touching AUC (which is threshold-independent). Youden's J is the standard
+    ROC-based criterion for the single best cutoff.
+
+    Args:
+        y_true: Ground-truth binary labels (validation split), shape (N,).
+        prob_pos: Predicted probability of the positive class, shape (N,).
+        default: Threshold returned when a cutoff can't be estimated (only one
+            class present in `y_true`, or a degenerate/constant score).
+
+    Returns:
+        The positive-class probability threshold maximizing tpr - fpr, or
+        `default` if it can't be estimated.
+    """
+    y_true = np.asarray(y_true)
+    prob_pos = np.asarray(prob_pos)
+    if len(np.unique(y_true)) < 2:
+        return default
+    fpr, tpr, thresholds = roc_curve(y_true, prob_pos)
+    best = thresholds[np.argmax(tpr - fpr)]
+    # roc_curve prepends an artificial +inf threshold; guard against it.
+    return float(best) if np.isfinite(best) else default
+
+
 def plot_confusion_matrix(
     y_true: np.ndarray,
     y_pred: np.ndarray,

@@ -63,6 +63,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--k-folds", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, default=5)
+    parser.add_argument(
+        "--temporal-mode", type=str, default="context", choices=["off", "context", "diff"],
+        help="Temporal (dynamic-thermal) CNN input. 'off' = classic single frame; "
+             "'context' = stack of frames sampled across the sequence; "
+             "'diff' = anchor + (later frame - anchor) reheating maps. Default: context.",
+    )
+    parser.add_argument(
+        "--temporal-channels", type=int, default=5,
+        help="Number of input channels when --temporal-mode != off (anchor + N-1 sequence frames).",
+    )
+    parser.add_argument(
+        "--label-source", type=str, default="folder", choices=["folder", "biopsy"],
+        help="Ground-truth source: 'folder' = on-disk Healthy/Sick naming; "
+             "'biopsy' = biopsy-confirmed labels linked from --labels-xlsx (clean "
+             "benign×cancer task, drops ambiguous/inconsistent/pre-cancer). Default: folder.",
+    )
+    parser.add_argument(
+        "--labels-xlsx", type=Path, default=None,
+        help="Path to Labels_Skin_Cancer.xlsx (biopsy labels). "
+             "Defaults to data/raw/Labels_Skin_Cancer.xlsx when --label-source biopsy.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -125,6 +146,10 @@ def main() -> None:
     )
     results_dir = args.results_dir if args.results_dir is not None else (PROJECT_ROOT / "results" / "runs" / run_name)
 
+    labels_xlsx = args.labels_xlsx
+    if args.label_source == "biopsy" and labels_xlsx is None:
+        labels_xlsx = PROJECT_ROOT / "data/raw/Labels_Skin_Cancer.xlsx"
+
     config = TrainConfig(
         data_root=data_root,
         results_dir=results_dir,
@@ -132,6 +157,10 @@ def main() -> None:
         k_folds=args.k_folds or (3 if args.quick_test else 5),
         num_epochs=3 if args.quick_test else 50,
         patience=2 if args.quick_test else 7,
+        temporal_mode=args.temporal_mode,
+        temporal_channels=args.temporal_channels,
+        label_source=args.label_source,
+        labels_xlsx=labels_xlsx,
         seed=args.seed,
     )
     config.results_dir.mkdir(parents=True, exist_ok=True)

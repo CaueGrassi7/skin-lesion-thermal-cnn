@@ -16,12 +16,17 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torchvision.transforms import functional as TF
 
 CLASSES = ["Healthy", "Sick"]
 CLASS_TO_IDX = {cls: i for i, cls in enumerate(CLASSES)}
 
 
-def _collect_samples(data_root: Path, frame_stride: int = 1) -> list[dict]:
+def _collect_samples(
+    data_root: Path,
+    frame_stride: int = 1,
+    label_map: Optional[dict[str, int]] = None,
+) -> list[dict]:
     """Walk data_root/Class/Patient/ and return one record per frame.
 
     Args:
@@ -31,24 +36,50 @@ def _collect_samples(data_root: Path, frame_stride: int = 1) -> list[dict]:
             correlated (near-duplicate), so a stride > 1 reduces redundancy
             and helps prevent the model from memorizing patient-specific
             sequences instead of learning generalizable lesion features.
+        label_map: Optional mapping of folder name (patient_dir.name) → label.
+            When given, the on-disk Healthy/Sick heuristic is overridden by this
+            biopsy-confirmed label (see `src/labels.py`), and any folder absent
+            from the map is skipped entirely (excluded/ambiguous cases). When
+            None, the folder's parent class dir provides the label as before.
     """
     samples = []
     for class_dir in sorted(data_root.iterdir()):
         if not class_dir.is_dir() or class_dir.name not in CLASS_TO_IDX:
             continue
-        label = CLASS_TO_IDX[class_dir.name]
+        folder_label = CLASS_TO_IDX[class_dir.name]
         for patient_dir in sorted(class_dir.iterdir()):
             if not patient_dir.is_dir():
                 continue
+            if label_map is not None:
+                if patient_dir.name not in label_map:
+                    continue  # excluded/ambiguous biopsy case
+                label = label_map[patient_dir.name]
+            else:
+                label = folder_label
             match = re.search(r"Paciente_?(\d+)", patient_dir.name)
             patient_id = match.group(1) if match else patient_dir.name
             frame_paths = sorted(patient_dir.glob("*.png"))[::frame_stride]
-            for frame_path in frame_paths:
+            for pos, frame_path in enumerate(frame_paths):
                 samples.append(
                     {
                         "path": frame_path,
                         "label": label,
                         "patient_id": patient_id,
+                        # Stable per-sequence id = the folder name. One folder is
+                        # exactly one thermal sequence, so this is the correct
+                        # grouping key for sequence-level aggregation — unlike
+                        # `patient_id + label`, which collides when a patient has
+                        # two sequences of the same label (e.g. two lesao folders,
+                        # or a benign control + a suspect lesion that biopsied
+                        # benign) and would wrongly merge their frames.
+                        "seq_id": patient_dir.name,
+                        # Full ordered frame list of this sample's own sequence
+                        # plus this frame's position in it. Stored as a shared
+                        # reference (cheap) so the temporal dataset can build a
+                        # multi-channel input capturing the reheating trajectory
+                        # around/across the anchor frame. See TemporalThermalDataset.
+                        "seq_frames": frame_paths,
+                        "seq_pos": pos,
                     }
                 )
     return samples
@@ -118,11 +149,11 @@ def _patient_kfold_split(
     as validation exactly once across the k iterations.
 
     Each patient is assigned as a whole (both of its classes go to the same
-    fold) — in this dataset a majority of patients contribute frames to
-    *both* classes (a healthy region and a lesion region imaged for the same
-    person), so a given patient_id is not reliably tied to a single label,
-    and splitting a patient's frames across folds would leak identity-level
-    features (thermal signature, skin tone) between train and test.
+    fold) — many patients contribute frames to *both* classes (a benign lesion
+    and a suspect/malignant one imaged for the same person; `Healthy`=benign,
+    `Sick`=suspect), so a given patient_id is not reliably tied to a single
+    label, and splitting a patient's frames across folds would leak
+    identity-level features (thermal signature, skin tone) between train and test.
 
     Fold assignment is stratified by class frame count (not just patient
     count): a plain `idx % k` split can produce folds whose test-set class
@@ -188,10 +219,18 @@ def _build_loaders_from_splits(
     num_workers: int = 0,
     mean: Optional[float] = None,
     std: Optional[float] = None,
+    temporal_channels: int = 1,
+    temporal_mode: str = "off",
 ) -> Tuple[DataLoader, DataLoader, DataLoader, float, float]:
     """Build train/val/test DataLoaders from an already-computed split dict.
 
     Mean/std are computed from the split's training samples if not provided.
+
+    When `temporal_mode != "off"` and `temporal_channels > 1`, each sample is a
+    multi-channel tensor built by `TemporalThermalDataset` (anchor frame +
+    frames sampled across the same thermal sequence), so the CNN can see the
+    reheating dynamics — the diagnostic signal in dynamic thermal imaging (DTI).
+    Otherwise the classic single-frame `ThermalLesionDataset` is used.
 
     Returns:
         Tuple of (train_loader, val_loader, test_loader, mean, std).
@@ -199,8 +238,16 @@ def _build_loaders_from_splits(
     if mean is None or std is None:
         mean, std = compute_mean_std(splits["train"])
 
+    def make_dataset(split: str, split_samples: list[dict]) -> Dataset:
+        if temporal_mode == "off" or temporal_channels <= 1:
+            return ThermalLesionDataset(split_samples, transform=get_transforms(split, mean, std))
+        return TemporalThermalDataset(
+            split_samples, split, mean, std,
+            channels=temporal_channels, mode=temporal_mode,
+        )
+
     datasets = {
-        split: ThermalLesionDataset(split_samples, transform=get_transforms(split, mean, std))
+        split: make_dataset(split, split_samples)
         for split, split_samples in splits.items()
     }
     loaders = {
@@ -236,6 +283,107 @@ class ThermalLesionDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, sample["label"]
+
+
+class TemporalThermalDataset(Dataset):
+    """Dataset yielding a multi-channel *temporal* input per frame.
+
+    The dataset is dynamic thermal imaging (DTI): the discriminative signal for
+    benign vs. suspect lesions lives largely in how skin temperature evolves
+    across a sequence (the reheating trajectory), not in a single static frame.
+    A plain frame-level CNN never sees that. Each item here stacks, as channels:
+
+    - channel 0: the anchor frame (this sample's own frame) — kept so that
+      different anchors of the same sequence remain distinct samples (avoids
+      collapsing a ~hundred-frame sequence into one repeated input) ;
+    - channels 1..C-1: frames sampled at evenly-spaced positions across the
+      *whole* sequence, giving the model the global temperature trajectory.
+
+    `mode`:
+    - "context": channels are the raw frames (anchor + global samples).
+    - "diff": channels 1..C-1 are (global frame − anchor), emphasizing the
+      temperature *change* (reheating map) directly.
+
+    Geometric augmentation (train split only) is applied once to the stacked
+    tensor, so all channels share the same flip/affine — the spatial
+    correspondence across time is preserved. Only geometric augmentation is used
+    (no brightness/contrast jitter), since absolute intensity carries thermal
+    meaning. `jitter` randomly perturbs the global sampling positions at train
+    time (temporal augmentation); it is disabled for val/test for determinism.
+    """
+
+    def __init__(
+        self,
+        samples: list[dict],
+        split: str,
+        mean: float,
+        std: float,
+        channels: int = 5,
+        mode: str = "context",
+        jitter: int = 3,
+    ) -> None:
+        if mode not in ("context", "diff"):
+            raise ValueError(f"Unsupported temporal mode: {mode!r}. Use 'context' or 'diff'.")
+        self.samples = samples
+        self.split = split
+        self.mean = float(mean)
+        self.std = float(std)
+        self.channels = int(channels)
+        self.mode = mode
+        self.jitter = int(jitter) if split == "train" else 0
+        self._geo = (
+            transforms.Compose(
+                [
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.9, 1.1)),
+                ]
+            )
+            if split == "train"
+            else None
+        )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _load(self, path) -> torch.Tensor:
+        """Load one frame as a (1, H, W) float tensor in [0, 1]."""
+        return TF.to_tensor(Image.open(path).convert("L"))
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        sample = self.samples[idx]
+        frames = sample["seq_frames"]
+        n = len(frames)
+        anchor = self._load(sample["path"])  # (1, H, W)
+
+        k_ctx = self.channels - 1
+        if k_ctx > 0 and n > 1:
+            positions = np.linspace(0, n - 1, k_ctx)
+            if self.jitter:
+                positions = positions + np.random.randint(
+                    -self.jitter, self.jitter + 1, size=k_ctx
+                )
+            idxs = np.clip(np.round(positions).astype(int), 0, n - 1)
+            ctx = [self._load(frames[j]) for j in idxs]
+        else:
+            ctx = [anchor.clone() for _ in range(max(0, k_ctx))]
+
+        if self.mode == "diff":
+            chans = [anchor] + [c - anchor for c in ctx]
+        else:  # "context"
+            chans = [anchor] + ctx
+
+        x = torch.cat(chans, dim=0)  # (C, H, W)
+        if self._geo is not None:
+            x = self._geo(x)
+
+        # Raw-frame channels use the dataset mean/std; "diff" channels are
+        # already ~zero-centered, so only their scale is normalized.
+        norm_mean = [self.mean] * self.channels
+        norm_std = [self.std] * self.channels
+        if self.mode == "diff":
+            norm_mean = [self.mean] + [0.0] * (self.channels - 1)
+        x = TF.normalize(x, norm_mean, norm_std)
+        return x, sample["label"]
 
 
 def compute_class_weights(samples: list[dict], num_classes: int = len(CLASSES)) -> torch.Tensor:
@@ -274,10 +422,10 @@ def compute_temporal_features(samples: list[dict]) -> dict[str, np.ndarray]:
     partly in how a lesion's temperature evolves across the sequence (warming/
     cooling rate), not just in a single frame's static appearance. The CNN/
     classical pipeline otherwise treats every frame as i.i.d. and never sees
-    that dynamic. This computes, per (patient_id, label) sequence, simple
-    scalar summaries of the mean-intensity trajectory across its frames (in
-    the same order used by `_collect_samples`, i.e. sorted filename order
-    after striding):
+    that dynamic. This computes, per sequence (keyed by `seq_id`, the folder
+    name — one folder is one thermal sequence), simple scalar summaries of the
+    mean-intensity trajectory across its frames (in the same order used by
+    `_collect_samples`, i.e. sorted filename order after striding):
 
     - slope: least-squares slope of mean frame intensity vs. frame index
       (warming/cooling rate)
@@ -291,14 +439,13 @@ def compute_temporal_features(samples: list[dict]) -> dict[str, np.ndarray]:
             that cuts a sequence short — the trend would be meaningless).
 
     Returns:
-        Dict mapping "{patient_id}_{label}" (matching the group-id convention
-        used by `aggregate_by_group`) to a float array of shape
+        Dict mapping `seq_id` (the folder name, matching the group-id
+        convention used by `aggregate_by_group` here) to a float array of shape
         (TEMPORAL_FEATURE_DIM,), in the order of `TEMPORAL_FEATURE_NAMES`.
     """
     sequences: dict[str, list] = defaultdict(list)
     for s in samples:
-        key = f"{s['patient_id']}_{s['label']}"
-        sequences[key].append(s["path"])
+        sequences[s["seq_id"]].append(s["path"])
 
     features: dict[str, np.ndarray] = {}
     for key, paths in sequences.items():

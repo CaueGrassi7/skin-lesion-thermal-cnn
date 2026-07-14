@@ -30,6 +30,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
 from src.dataset import (
+    TemporalThermalDataset,
     ThermalLesionDataset,
     _build_loaders_from_splits,
     _collect_samples,
@@ -38,7 +39,8 @@ from src.dataset import (
     compute_temporal_features,
     get_transforms,
 )
-from src.evaluate import aggregate_by_group, compute_metrics
+from src.evaluate import aggregate_by_group, best_threshold, compute_metrics
+from src.labels import build_label_map, write_report
 from src.model_classical import (
     extract_cnn_embeddings,
     predict_classical,
@@ -75,6 +77,23 @@ class TrainConfig:
     frame_stride: int = 5
     k_folds: int = 5
     num_classes: int = 2
+    # Temporal (dynamic-thermal) input: instead of a single grayscale frame,
+    # feed the CNNs a `temporal_channels`-channel stack built from the frame's
+    # own sequence (anchor + frames sampled across the reheating trajectory) —
+    # see `dataset.TemporalThermalDataset`. The diagnostic signal in DTI is the
+    # temperature *dynamics*, which a single static frame does not expose (the
+    # frame-level val AUC hovered near chance in earlier runs). `temporal_mode`:
+    # "off" = classic single-frame input; "context" = raw stacked frames;
+    # "diff" = anchor + (later frame − anchor) reheating maps.
+    temporal_channels: int = 5
+    temporal_mode: str = "context"
+    # Ground-truth source. "folder" = the on-disk Healthy/Sick heuristic;
+    # "biopsy" = biopsy-confirmed labels linked from `labels_xlsx` (see
+    # `src/labels.py`), which fixes label noise (lesao folders that biopsied
+    # benign) and drops ambiguous/inconsistent/pre-cancer sequences — the clean
+    # benign×cancer task. Requires `labels_xlsx` to be set.
+    label_source: str = "folder"
+    labels_xlsx: Optional[Path] = None
     lr: float = 1e-3
     weight_decay: float = 5e-4  # increased from 1e-4 to reduce overfitting
     num_epochs: int = 50
@@ -83,15 +102,32 @@ class TrainConfig:
     resnet_phase1_epochs: int = 10
     resnet_phase1_patience: int = 4
     resnet_phase2_lr: float = 1e-4
-    svm_rf_tune_iter: int = 8
-    svm_rf_tune_cv: int = 3
+    # Validation-tuned decision threshold (Youden's J) instead of a fixed 0.5
+    # argmax. Disabled by default: an ablation run (results/runs/20260713_182250)
+    # showed it fixes a miscalibrated model (ThermalCNN's specificity collapse)
+    # but destabilizes the already-well-calibrated ones — the threshold is
+    # estimated on only ~30 validation sequences and does not transfer to test
+    # (RF specificity swung from a stable 0.76 to 0.24–0.94 across folds). Left
+    # behind a flag so it can be re-enabled for a per-model operating-point study.
+    tune_threshold: bool = False
+    svm_rf_tune_iter: int = 12  # was 8
+    svm_rf_tune_cv: int = 5  # was 3
     seed: int = 42
+
+    @property
+    def in_channels(self) -> int:
+        """Number of input channels the CNNs receive (1 for single-frame input,
+        `temporal_channels` for a temporal stack)."""
+        if self.temporal_mode == "off" or self.temporal_channels <= 1:
+            return 1
+        return self.temporal_channels
 
     def to_json_dict(self) -> dict:
         """Serialize to a JSON-safe dict (Path fields as strings)."""
         d = asdict(self)
         d["data_root"] = str(self.data_root)
         d["results_dir"] = str(self.results_dir)
+        d["labels_xlsx"] = str(self.labels_xlsx) if self.labels_xlsx is not None else None
         return d
 
 
@@ -251,8 +287,8 @@ def _temporal_feature_matrix(
     fold_samples: list[dict], temporal_features: dict[str, np.ndarray],
 ) -> np.ndarray:
     """Map each sample in `fold_samples` (same order) to its sequence's
-    precomputed thermal-dynamics feature vector (patient_id + label)."""
-    keys = [f"{s['patient_id']}_{s['label']}" for s in fold_samples]
+    precomputed thermal-dynamics feature vector (keyed by seq_id)."""
+    keys = [s["seq_id"] for s in fold_samples]
     return np.stack([temporal_features[k] for k in keys])
 
 
@@ -281,11 +317,12 @@ def _train_and_evaluate_fold(
     results_dir = config.results_dir
     train_loader, val_loader, test_loader, mean, std = _build_loaders_from_splits(
         fold_splits, batch_size=config.batch_size, num_workers=0,
+        temporal_channels=config.temporal_channels, temporal_mode=config.temporal_mode,
     )
     # test_loader doesn't shuffle (shuffle=False for splits != "train"), so
     # prediction order matches fold_splits["test"] order. Same for val.
-    test_seq_ids = [f"{s['patient_id']}_{s['label']}" for s in fold_splits["test"]]
-    val_seq_ids = [f"{s['patient_id']}_{s['label']}" for s in fold_splits["val"]]
+    test_seq_ids = [s["seq_id"] for s in fold_splits["test"]]
+    val_seq_ids = [s["seq_id"] for s in fold_splits["val"]]
 
     # Fold class weights — corrects per-fold class imbalance (see
     # `_patient_kfold_split`), which without correction could make a model
@@ -296,11 +333,25 @@ def _train_and_evaluate_fold(
     results_seq: list[dict] = []
     predictions: dict = {}
 
-    def record(model_name, y_true, y_pred, y_prob):
+    def record(model_name, y_true, y_prob, val_true, val_prob):
+        # Decision threshold tuned on the validation split (Youden's J) rather
+        # than a fixed 0.5 argmax — see `TrainConfig.tune_threshold`. Frame and
+        # sequence granularities get their own threshold because aggregating
+        # frames into a mean probability shifts the score distribution.
+        thr_frame = (
+            best_threshold(val_true, val_prob[:, 1]) if config.tune_threshold else 0.5
+        )
+        y_pred = (y_prob[:, 1] >= thr_frame).astype(int)
         results.append({
             "fold": fold_idx, "model": model_name, **compute_metrics(y_true, y_pred, y_prob),
         })
-        seq_true, seq_pred, seq_prob = aggregate_by_group(y_true, y_prob, test_seq_ids)
+
+        seq_true, _, seq_prob = aggregate_by_group(y_true, y_prob, test_seq_ids)
+        val_seq_true, _, val_seq_prob = aggregate_by_group(val_true, val_prob, val_seq_ids)
+        thr_seq = (
+            best_threshold(val_seq_true, val_seq_prob[:, 1]) if config.tune_threshold else 0.5
+        )
+        seq_pred = (seq_prob[:, 1] >= thr_seq).astype(int)
         results_seq.append({
             "fold": fold_idx, "model": model_name,
             **compute_metrics(seq_true, seq_pred, seq_prob),
@@ -308,7 +359,7 @@ def _train_and_evaluate_fold(
         predictions[model_name] = (y_true, y_pred, y_prob)
 
     # --- ThermalCNN ---
-    cnn_model = ThermalCNN(num_classes=config.num_classes, in_channels=1)
+    cnn_model = ThermalCNN(num_classes=config.num_classes, in_channels=config.in_channels)
     cnn_model, cnn_history = _training_loop(
         cnn_model, train_loader, val_loader, device,
         model_name=f"ThermalCNN[fold {fold_idx}]",
@@ -317,12 +368,14 @@ def _train_and_evaluate_fold(
         class_weights=class_weights, val_group_ids=val_seq_ids,
         checkpoint_path=results_dir / f"checkpoint_thermal_cnn_fold{fold_idx}.pth",
     )
-    cnn_true, cnn_pred, cnn_prob = _predict_probs(cnn_model, test_loader, device)
-    record("ThermalCNN", cnn_true, cnn_pred, cnn_prob)
+    cnn_true, _, cnn_prob = _predict_probs(cnn_model, test_loader, device)
+    cnn_val_true, _, cnn_val_prob = _predict_probs(cnn_model, val_loader, device)
+    record("ThermalCNN", cnn_true, cnn_prob, cnn_val_true, cnn_val_prob)
 
     # --- ResNet18 (phase 1: frozen backbone, phase 2: full fine-tuning) ---
     resnet_model = build_transfer_model(
         "resnet18", num_classes=config.num_classes, pretrained=True, freeze_backbone=True,
+        in_channels=config.in_channels,
     )
     resnet_model, _ = _training_loop(
         resnet_model, train_loader, val_loader, device,
@@ -341,8 +394,9 @@ def _train_and_evaluate_fold(
         class_weights=class_weights, val_group_ids=val_seq_ids,
         checkpoint_path=results_dir / f"checkpoint_resnet18_fold{fold_idx}.pth",
     )
-    res_true, res_pred, res_prob = _predict_probs(resnet_model, test_loader, device)
-    record("ResNet18", res_true, res_pred, res_prob)
+    res_true, _, res_prob = _predict_probs(resnet_model, test_loader, device)
+    res_val_true, _, res_val_prob = _predict_probs(resnet_model, val_loader, device)
+    record("ResNet18", res_true, res_prob, res_val_true, res_val_prob)
 
     # --- SVM and Random Forest on ResNet18 embeddings + thermal dynamics ---
     # Uses ResNet18 (the highest-AUC model) as the feature extractor rather
@@ -354,12 +408,24 @@ def _train_and_evaluate_fold(
     # on every extraction and applied random augmentation, injecting
     # unnecessary noise into the features fed to SVM/RF — the goal is a stable
     # representation of the frame, not training diversity.
+    if config.in_channels > 1:
+        train_eval_dataset: object = TemporalThermalDataset(
+            fold_splits["train"], "val", mean, std,
+            channels=config.temporal_channels, mode=config.temporal_mode,
+        )
+    else:
+        train_eval_dataset = ThermalLesionDataset(
+            fold_splits["train"], transform=get_transforms("val", mean, std),
+        )
     train_eval_loader = DataLoader(
-        ThermalLesionDataset(fold_splits["train"], transform=get_transforms("val", mean, std)),
-        batch_size=config.batch_size, shuffle=False,
+        train_eval_dataset, batch_size=config.batch_size, shuffle=False,
     )
     X_train_emb, y_train_emb = extract_cnn_embeddings(resnet_model, train_eval_loader, device)
     X_test_emb, y_test_emb = extract_cnn_embeddings(resnet_model, test_loader, device)
+    # val embeddings for validation-set threshold tuning (val_loader already
+    # uses the no-augmentation "val" transform and shuffle=False, so its order
+    # matches fold_splits["val"] and val_seq_ids).
+    X_val_emb, y_val_emb = extract_cnn_embeddings(resnet_model, val_loader, device)
 
     # Thermal-dynamics features (warming/cooling rate etc., see
     # `compute_temporal_features`) concatenated to the embedding — the dataset
@@ -368,10 +434,12 @@ def _train_and_evaluate_fold(
     # across the sequence.
     X_train_temporal = _temporal_feature_matrix(fold_splits["train"], temporal_features)
     X_test_temporal = _temporal_feature_matrix(fold_splits["test"], temporal_features)
+    X_val_temporal = _temporal_feature_matrix(fold_splits["val"], temporal_features)
 
     scaler = StandardScaler().fit(np.hstack([X_train_emb, X_train_temporal]))
     X_train_full = scaler.transform(np.hstack([X_train_emb, X_train_temporal]))
     X_test_full = scaler.transform(np.hstack([X_test_emb, X_test_temporal]))
+    X_val_full = scaler.transform(np.hstack([X_val_emb, X_val_temporal]))
 
     # groups=patient_id (not patient_id+label) for the inner GroupKFold of the
     # hyperparameter search: a patient contributes frames to both classes, so
@@ -383,15 +451,17 @@ def _train_and_evaluate_fold(
         X_train_full, y_train_emb, groups=train_patient_ids,
         n_iter=config.svm_rf_tune_iter, cv=config.svm_rf_tune_cv,
     )
-    svm_pred, svm_prob = predict_classical(svm, X_test_full, n_classes=config.num_classes)
-    record("SVM", y_test_emb, svm_pred, svm_prob)
+    _, svm_prob = predict_classical(svm, X_test_full, n_classes=config.num_classes)
+    _, svm_val_prob = predict_classical(svm, X_val_full, n_classes=config.num_classes)
+    record("SVM", y_test_emb, svm_prob, y_val_emb, svm_val_prob)
 
     rf = tune_random_forest(
         X_train_full, y_train_emb, groups=train_patient_ids,
         n_iter=config.svm_rf_tune_iter, cv=config.svm_rf_tune_cv,
     )
-    rf_pred, rf_prob = predict_classical(rf, X_test_full, n_classes=config.num_classes)
-    record("Random Forest", y_test_emb, rf_pred, rf_prob)
+    _, rf_prob = predict_classical(rf, X_test_full, n_classes=config.num_classes)
+    _, rf_val_prob = predict_classical(rf, X_val_full, n_classes=config.num_classes)
+    record("Random Forest", y_test_emb, rf_prob, y_val_emb, rf_val_prob)
 
     logger.info("--- Fold %d concluido ---", fold_idx)
     for r, r_seq in zip(results, results_seq):
@@ -453,10 +523,27 @@ def run_cross_validation(config: TrainConfig, device: torch.device) -> None:
     all outputs under `config.results_dir`."""
     config.results_dir.mkdir(parents=True, exist_ok=True)
 
+    label_map = None
+    if config.label_source == "biopsy":
+        if config.labels_xlsx is None:
+            raise ValueError("label_source='biopsy' requires config.labels_xlsx to be set.")
+        records = build_label_map(config.labels_xlsx, config.data_root)
+        report_path = config.results_dir / "biopsy_label_report.csv"
+        tally = write_report(records, report_path)
+        label_map = {r.folder: r.label for r in records if r.label is not None}
+        logger.info(
+            "Rótulos por biópsia: %d sequências usadas, %d excluídas. Relatório: %s",
+            len(label_map), len(records) - len(label_map), report_path,
+        )
+        logger.info("Status dos rótulos: %s", tally)
+
     logger.info(
-        "Coletando amostras de %s (frame_stride=%d)...", config.data_root, config.frame_stride,
+        "Coletando amostras de %s (frame_stride=%d, label_source=%s)...",
+        config.data_root, config.frame_stride, config.label_source,
     )
-    samples = _collect_samples(config.data_root, frame_stride=config.frame_stride)
+    samples = _collect_samples(
+        config.data_root, frame_stride=config.frame_stride, label_map=label_map,
+    )
     folds = _patient_kfold_split(samples, k=config.k_folds, seed=config.seed)
 
     # Thermal-dynamics features (one per patient+class sequence) computed once
