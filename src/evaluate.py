@@ -113,6 +113,57 @@ def aggregate_by_group(
     return y_true_agg, y_pred_agg, y_prob_agg
 
 
+def pooled_auc_ci(
+    y_true: np.ndarray,
+    prob_pos: np.ndarray,
+    n_boot: int = 2000,
+    seed: int = 42,
+    alpha: float = 0.05,
+) -> tuple[float, float, float]:
+    """AUC over pooled predictions with a stratified bootstrap confidence interval.
+
+    With only ~168 sequences split into 5 folds, the mean of five per-fold AUCs
+    is a very noisy estimator (each fold's AUC comes from ~33 sequences). Pooling
+    every fold's held-out per-sequence prediction into a single set — each
+    sequence is a test sequence exactly once — and computing one AUC over all of
+    them is far more stable, and a bootstrap CI quantifies the residual
+    uncertainty honestly. The bootstrap is *stratified* (resampling within each
+    class) so every replicate keeps the original class balance and AUC stays
+    defined.
+
+    Args:
+        y_true: Ground-truth binary labels (pooled across folds), shape (N,).
+        prob_pos: Predicted probability of the positive class, shape (N,).
+        n_boot: Number of bootstrap replicates.
+        seed: Seed for the bootstrap resampling (reproducible CI).
+        alpha: Two-sided significance level (0.05 → 95% CI).
+
+    Returns:
+        Tuple of (point AUC, CI lower bound, CI upper bound). Lower/upper are NaN
+        if a CI can't be formed (only one class present).
+    """
+    from sklearn.metrics import roc_auc_score
+
+    y_true = np.asarray(y_true)
+    prob_pos = np.asarray(prob_pos)
+    if len(np.unique(y_true)) < 2:
+        return float("nan"), float("nan"), float("nan")
+
+    point = float(roc_auc_score(y_true, prob_pos))
+    rng = np.random.default_rng(seed)
+    pos = np.where(y_true == 1)[0]
+    neg = np.where(y_true == 0)[0]
+    boots = np.empty(n_boot, dtype=float)
+    for b in range(n_boot):
+        idx = np.concatenate([
+            rng.choice(pos, size=len(pos), replace=True),
+            rng.choice(neg, size=len(neg), replace=True),
+        ])
+        boots[b] = roc_auc_score(y_true[idx], prob_pos[idx])
+    lo, hi = np.percentile(boots, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return point, float(lo), float(hi)
+
+
 def best_threshold(
     y_true: np.ndarray,
     prob_pos: np.ndarray,

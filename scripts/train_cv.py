@@ -64,10 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k-folds", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, default=5)
     parser.add_argument(
-        "--temporal-mode", type=str, default="context", choices=["off", "context", "diff"],
+        "--temporal-mode", type=str, default="off", choices=["off", "context", "diff"],
         help="Temporal (dynamic-thermal) CNN input. 'off' = classic single frame; "
              "'context' = stack of frames sampled across the sequence; "
-             "'diff' = anchor + (later frame - anchor) reheating maps. Default: context.",
+             "'diff' = anchor + (later frame - anchor) reheating maps. Default: off "
+             "('context'/'diff' empirically hurt patient-level AUC — see CLAUDE.md).",
     )
     parser.add_argument(
         "--temporal-channels", type=int, default=5,
@@ -83,6 +84,36 @@ def parse_args() -> argparse.Namespace:
         "--labels-xlsx", type=Path, default=None,
         help="Path to Labels_Skin_Cancer.xlsx (biopsy labels). "
              "Defaults to data/raw/Labels_Skin_Cancer.xlsx when --label-source biopsy.",
+    )
+    parser.add_argument(
+        "--classical-level", type=str, default="sequence", choices=["sequence", "frame"],
+        help="Granularity of the SVM/Random Forest models. 'sequence' (default) "
+             "pools each sequence's frame embeddings into one row (matches the "
+             "unit of analysis); 'frame' classifies frames independently then "
+             "pools at prediction time (legacy). Neural models are unaffected.",
+    )
+    parser.add_argument(
+        "--thermal-roi", type=str, default="full", choices=["full", "center", "hot"],
+        help="Region the thermal-dynamics trajectory is measured over: 'full' = "
+             "whole frame (original); 'center' = central half; 'hot' = Otsu "
+             "hottest region (lesion proxy). Localising concentrates the "
+             "reheating signal on the lesion. Default: full.",
+    )
+    parser.add_argument(
+        "--thermal-features", type=str, default="basic", choices=["basic", "rich"],
+        help="Thermal-feature set fed to SVM/RF: 'basic' = 4 trajectory summaries "
+             "(original); 'rich' = adds reheating-curve shape + spatial-"
+             "heterogeneity descriptors. Default: basic.",
+    )
+    parser.add_argument(
+        "--seq-pool", type=str, default="mean", choices=["mean", "meanstdmax"],
+        help="How a sequence's per-frame embeddings are pooled for the "
+             "sequence-level classical models: 'mean' (original) or 'meanstdmax' "
+             "(mean⊕std⊕max — a sequence-level distribution summary). Default: mean.",
+    )
+    parser.add_argument(
+        "--no-ensemble", action="store_true",
+        help="Disable the ResNet18+SVM+RF probability-averaging ensemble (on by default).",
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -161,6 +192,11 @@ def main() -> None:
         temporal_channels=args.temporal_channels,
         label_source=args.label_source,
         labels_xlsx=labels_xlsx,
+        classical_level=args.classical_level,
+        thermal_roi=args.thermal_roi,
+        thermal_features=args.thermal_features,
+        seq_pool=args.seq_pool,
+        ensemble=not args.no_ensemble,
         seed=args.seed,
     )
     config.results_dir.mkdir(parents=True, exist_ok=True)

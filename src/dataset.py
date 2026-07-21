@@ -411,11 +411,68 @@ def compute_class_weights(samples: list[dict], num_classes: int = len(CLASSES)) 
     return torch.tensor(weights, dtype=torch.float32)
 
 
-TEMPORAL_FEATURE_NAMES = ["slope", "delta_first_last", "std_across_frames", "range"]
+# Basic thermal-dynamics features (the original set): summaries of the
+# ROI mean-intensity trajectory across a sequence's frames.
+TEMPORAL_FEATURE_NAMES_BASIC = ["slope", "delta_first_last", "std_across_frames", "range"]
+# Rich set: the basic four plus finer descriptors of the reheating curve
+# (when it peaks, how fast early vs. late, how the hot region's spatial
+# heterogeneity and extent evolve). All still keyed on the ROI trajectory.
+TEMPORAL_FEATURE_NAMES_RICH = TEMPORAL_FEATURE_NAMES_BASIC + [
+    "time_to_peak_norm",
+    "early_slope",
+    "late_slope",
+    "peak_to_end",
+    "mean_spatial_std",
+    "spatial_std_slope",
+    "hot_area_mean",
+    "hot_area_slope",
+]
+# Backward-compatible aliases (the basic set is the default).
+TEMPORAL_FEATURE_NAMES = TEMPORAL_FEATURE_NAMES_BASIC
 TEMPORAL_FEATURE_DIM = len(TEMPORAL_FEATURE_NAMES)
 
 
-def compute_temporal_features(samples: list[dict]) -> dict[str, np.ndarray]:
+def temporal_feature_names(feature_set: str = "basic") -> list[str]:
+    """Return the ordered feature names for a given thermal-feature set."""
+    return TEMPORAL_FEATURE_NAMES_RICH if feature_set == "rich" else TEMPORAL_FEATURE_NAMES_BASIC
+
+
+def _roi_pixels(arr: np.ndarray, roi: str) -> np.ndarray:
+    """Select the region-of-interest pixels of one frame (2D float in [0,1]).
+
+    ``full`` keeps the whole frame; ``center`` keeps the central half (the
+    lesion is roughly centred by the acquisition protocol); ``hot`` keeps the
+    hottest pixels via an Otsu threshold (an unsupervised lesion/hot-spot
+    proxy). Falls back to the whole frame if the ROI would be empty.
+    """
+    if roi == "center":
+        h, w = arr.shape
+        sub = arr[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
+        return sub.ravel() if sub.size else arr.ravel()
+    if roi == "hot":
+        from skimage.filters import threshold_otsu
+
+        try:
+            thr = threshold_otsu(arr)
+        except Exception:  # constant frame → Otsu undefined
+            thr = float(arr.mean())
+        mask = arr >= thr
+        return arr[mask] if mask.any() else arr.ravel()
+    return arr.ravel()
+
+
+def _slope(y: np.ndarray) -> float:
+    """Least-squares slope of ``y`` against its own index (0 if < 2 points)."""
+    if len(y) < 2:
+        return 0.0
+    return float(np.polyfit(np.arange(len(y)), y, 1)[0])
+
+
+def compute_temporal_features(
+    samples: list[dict],
+    roi: str = "full",
+    feature_set: str = "basic",
+) -> dict[str, np.ndarray]:
     """Compute per-sequence thermal-dynamics features from frame intensity over time.
 
     The dataset is *dynamic* thermal imaging (DTI) — diagnostic signal lives
@@ -423,46 +480,85 @@ def compute_temporal_features(samples: list[dict]) -> dict[str, np.ndarray]:
     cooling rate), not just in a single frame's static appearance. The CNN/
     classical pipeline otherwise treats every frame as i.i.d. and never sees
     that dynamic. This computes, per sequence (keyed by `seq_id`, the folder
-    name — one folder is one thermal sequence), simple scalar summaries of the
-    mean-intensity trajectory across its frames (in the same order used by
-    `_collect_samples`, i.e. sorted filename order after striding):
+    name — one folder is one thermal sequence), scalar summaries of the
+    ROI intensity trajectory across its frames (in the same order used by
+    `_collect_samples`, i.e. sorted filename order after striding).
 
-    - slope: least-squares slope of mean frame intensity vs. frame index
-      (warming/cooling rate)
-    - delta_first_last: last frame's mean intensity minus the first frame's
-    - std_across_frames: std of per-frame mean intensity (temporal variability)
-    - range: max minus min of per-frame mean intensity
+    ``roi`` chooses which pixels of each frame the trajectory is measured over
+    — ``full`` (whole frame, the original behaviour), ``center`` (central half),
+    or ``hot`` (Otsu-thresholded hottest region, an unsupervised lesion proxy).
+    Localising the ROI concentrates the reheating signal on the lesion instead
+    of diluting it across background and healthy skin.
+
+    ``feature_set`` chooses ``basic`` (the original four) or ``rich`` (adds
+    reheating-curve shape and spatial-heterogeneity descriptors — see
+    ``TEMPORAL_FEATURE_NAMES_RICH``).
+
+    Basic features (ROI mean-intensity trajectory):
+    - slope: least-squares slope vs. frame index (warming/cooling rate)
+    - delta_first_last: last frame's ROI mean minus the first frame's
+    - std_across_frames: std of per-frame ROI mean (temporal variability)
+    - range: max minus min of per-frame ROI mean
 
     Args:
         samples: Sample list (as returned by `_collect_samples`), covering
             one or more full patient sequences (do not pass a frame subset
             that cuts a sequence short — the trend would be meaningless).
+        roi: ROI selection mode ("full" | "center" | "hot").
+        feature_set: "basic" | "rich".
 
     Returns:
         Dict mapping `seq_id` (the folder name, matching the group-id
-        convention used by `aggregate_by_group` here) to a float array of shape
-        (TEMPORAL_FEATURE_DIM,), in the order of `TEMPORAL_FEATURE_NAMES`.
+        convention used by `aggregate_by_group` here) to a float array whose
+        length/order match `temporal_feature_names(feature_set)`.
     """
+    rich = feature_set == "rich"
+    dim = len(temporal_feature_names(feature_set))
+
     sequences: dict[str, list] = defaultdict(list)
     for s in samples:
         sequences[s["seq_id"]].append(s["path"])
 
     features: dict[str, np.ndarray] = {}
     for key, paths in sequences.items():
-        means = np.array(
-            [np.asarray(Image.open(p).convert("L"), dtype=np.float32).mean() / 255.0 for p in paths]
-        )
+        means, spatial_stds, hot_areas = [], [], []
+        for p in paths:
+            arr = np.asarray(Image.open(p).convert("L"), dtype=np.float32) / 255.0
+            pix = _roi_pixels(arr, roi)
+            means.append(float(pix.mean()))
+            if rich:
+                spatial_stds.append(float(pix.std()))
+                hot_areas.append(float(_roi_pixels(arr, "hot").size) / float(arr.size))
+        means = np.asarray(means, dtype=np.float32)
+
         if len(means) < 2:
-            features[key] = np.zeros(TEMPORAL_FEATURE_DIM, dtype=np.float32)
+            features[key] = np.zeros(dim, dtype=np.float32)
             continue
-        frame_idx = np.arange(len(means))
-        slope = float(np.polyfit(frame_idx, means, 1)[0])
+
+        slope = _slope(means)
         delta_first_last = float(means[-1] - means[0])
         std_across_frames = float(means.std())
         value_range = float(means.max() - means.min())
-        features[key] = np.array(
-            [slope, delta_first_last, std_across_frames, value_range], dtype=np.float32
-        )
+        vec = [slope, delta_first_last, std_across_frames, value_range]
+
+        if rich:
+            n = len(means)
+            half = max(1, n // 2)
+            spatial_stds = np.asarray(spatial_stds, dtype=np.float32)
+            hot_areas = np.asarray(hot_areas, dtype=np.float32)
+            peak_idx = int(np.argmax(means))
+            vec += [
+                peak_idx / (n - 1),                      # time_to_peak_norm
+                _slope(means[:half]),                    # early_slope
+                _slope(means[half:]),                    # late_slope
+                float(means.max() - means[-1]),          # peak_to_end (cooling)
+                float(spatial_stds.mean()),              # mean_spatial_std
+                _slope(spatial_stds),                    # spatial_std_slope
+                float(hot_areas.mean()),                 # hot_area_mean
+                _slope(hot_areas),                       # hot_area_slope
+            ]
+
+        features[key] = np.asarray(vec, dtype=np.float32)
     return features
 
 

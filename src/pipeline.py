@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 MODEL_NAMES = ["ThermalCNN", "ResNet18", "SVM", "Random Forest"]
 FILE_SLUG = {
     "ThermalCNN": "thermal_cnn", "ResNet18": "resnet18", "SVM": "svm", "Random Forest": "rf",
+    "Ensemble": "ensemble",
 }
 
 
@@ -86,7 +87,11 @@ class TrainConfig:
     # "off" = classic single-frame input; "context" = raw stacked frames;
     # "diff" = anchor + (later frame − anchor) reheating maps.
     temporal_channels: int = 5
-    temporal_mode: str = "context"
+    # Default "off" (single-frame): a controlled isolation showed the
+    # channel-stacking temporal input HURTS patient-level AUC for every strong
+    # model (see the "Temporal input" note in CLAUDE.md). "context"/"diff" are
+    # kept for ablation but are not the recommended path.
+    temporal_mode: str = "off"
     # Ground-truth source. "folder" = the on-disk Healthy/Sick heuristic;
     # "biopsy" = biopsy-confirmed labels linked from `labels_xlsx` (see
     # `src/labels.py`), which fixes label noise (lesao folders that biopsied
@@ -94,6 +99,34 @@ class TrainConfig:
     # benign×cancer task. Requires `labels_xlsx` to be set.
     label_source: str = "folder"
     labels_xlsx: Optional[Path] = None
+    # Granularity at which SVM/Random Forest operate. "sequence" (default) pools
+    # every sequence's per-frame CNN embeddings into a single vector (mean-pooled
+    # embedding ⊕ thermal-dynamics features) and trains/predicts one row per
+    # sequence — matching the true unit of analysis (~168 sequences), removing the
+    # near-duplicate-frame inflation that a per-frame classifier gets, and cutting
+    # the inner-CV leakage surface. "frame" keeps the older per-frame path (frames
+    # classified independently, then mean-pooled by sequence at prediction time)
+    # for backward-comparison with pre-sequence runs. The neural models
+    # (ThermalCNN/ResNet18) are unaffected either way.
+    classical_level: str = "sequence"
+    # Which pixels the thermal-dynamics trajectory is measured over
+    # (`compute_temporal_features`): "full" = whole frame (original), "center" =
+    # central half, "hot" = Otsu-thresholded hottest region (lesion proxy).
+    # Localising the ROI concentrates the reheating signal on the lesion.
+    thermal_roi: str = "full"
+    # Thermal-feature set: "basic" = the original 4 trajectory summaries;
+    # "rich" = adds reheating-curve shape + spatial-heterogeneity descriptors.
+    thermal_features: str = "basic"
+    # How a sequence's per-frame CNN embeddings are collapsed into one row for
+    # the sequence-level classical models: "mean" (original) or "meanstdmax"
+    # (concatenate per-dimension mean, std and max — a cheap order-invariant
+    # summary of the whole embedding distribution across the sequence, i.e. a
+    # genuinely sequence-level representation rather than just the centroid).
+    # Only affects classical_level="sequence".
+    seq_pool: str = "mean"
+    # Also fit a probability-averaging ensemble of ResNet18 + SVM + Random Forest
+    # at the sequence level, saved as an extra "Ensemble" model.
+    ensemble: bool = True
     lr: float = 1e-3
     weight_decay: float = 5e-4  # increased from 1e-4 to reduce overfitting
     num_epochs: int = 50
@@ -292,6 +325,61 @@ def _temporal_feature_matrix(
     return np.stack([temporal_features[k] for k in keys])
 
 
+def _pool_embeddings_by_sequence(
+    fold_samples: list[dict],
+    embeddings: np.ndarray,
+    temporal_features: dict[str, np.ndarray],
+    seq_pool: str = "mean",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """Collapse per-frame embeddings into one feature row per sequence.
+
+    `embeddings[i]` must correspond to `fold_samples[i]` (same order) — true
+    when they come from a no-shuffle DataLoader built from `fold_samples`. All
+    frames sharing a `seq_id` (folder name = one thermal sequence) are
+    pooled into a single embedding, then the sequence's thermal-dynamics
+    feature vector is concatenated. This is the classical models' sequence-level
+    input: the unit of analysis is the sequence, not the (near-duplicate) frame.
+
+    `seq_pool` controls the pooling: "mean" collapses to the per-dimension
+    centroid (original); "meanstdmax" concatenates the per-dimension mean, std
+    and max, an order-invariant summary of the whole embedding *distribution*
+    across the sequence — a genuinely sequence-level representation (how the
+    per-frame features spread and peak over the reheating trajectory), not just
+    where they centre.
+
+    Returns:
+        X: (n_sequences, pooled_dim + temporal_dim) feature matrix, where
+            pooled_dim is embed_dim ("mean") or 3*embed_dim ("meanstdmax").
+        y: (n_sequences,) label per sequence.
+        groups: (n_sequences,) patient_id per sequence, for the grouped inner CV
+            of the hyperparameter search (a patient can own several sequences).
+        seq_ids: sequence ids in row order (order of first appearance).
+    """
+    order = list(dict.fromkeys(s["seq_id"] for s in fold_samples))
+    buckets: dict[str, list[np.ndarray]] = {sid: [] for sid in order}
+    label: dict[str, int] = {}
+    patient: dict[str, str] = {}
+    for s, emb in zip(fold_samples, embeddings):
+        sid = s["seq_id"]
+        buckets[sid].append(emb)
+        label[sid] = s["label"]
+        patient[sid] = s["patient_id"]
+
+    rows, y, groups = [], [], []
+    for sid in order:
+        stacked = np.stack(buckets[sid])
+        if seq_pool == "meanstdmax":
+            pooled = np.concatenate(
+                [stacked.mean(axis=0), stacked.std(axis=0), stacked.max(axis=0)]
+            )
+        else:
+            pooled = stacked.mean(axis=0)
+        rows.append(np.concatenate([pooled, temporal_features[sid]]))
+        y.append(label[sid])
+        groups.append(patient[sid])
+    return np.stack(rows), np.array(y), np.array(groups), order
+
+
 def _train_and_evaluate_fold(
     fold_splits: dict[str, list[dict]],
     fold_idx: int,
@@ -311,7 +399,12 @@ def _train_and_evaluate_fold(
     Returns:
         results: list of dicts (one per model, frame level) with fold, model, and metrics.
         results_seq: same, at patient/sequence level (aggregated).
-        predictions: dict model -> (y_true, y_pred, y_prob) on the test fold (frame level).
+        predictions: dict model -> (y_true, y_pred, y_prob) on the test fold (frame
+            level for the neural models; sequence level for the classical models
+            when `classical_level="sequence"`, their native granularity).
+        predictions_seq: dict model -> (seq_true, seq_pred, seq_prob, seq_ids),
+            one row per test sequence — the honest per-sequence predictions used
+            for the pooled AUC + bootstrap CI in the notebook.
         histories: dict with ThermalCNN's and ResNet18's training history.
     """
     results_dir = config.results_dir
@@ -332,6 +425,12 @@ def _train_and_evaluate_fold(
     results: list[dict] = []
     results_seq: list[dict] = []
     predictions: dict = {}
+    # Sequence-level pooled test predictions per model, with their seq_ids. Each
+    # sequence is a test sequence in exactly one fold, so concatenating these
+    # across folds yields one honest prediction per sequence over the whole
+    # dataset — the input for the pooled AUC + bootstrap CI in the notebook.
+    predictions_seq: dict = {}
+    unique_test_seq_ids = list(dict.fromkeys(test_seq_ids))
 
     def record(model_name, y_true, y_prob, val_true, val_prob):
         # Decision threshold tuned on the validation split (Youden's J) rather
@@ -357,6 +456,22 @@ def _train_and_evaluate_fold(
             **compute_metrics(seq_true, seq_pred, seq_prob),
         })
         predictions[model_name] = (y_true, y_pred, y_prob)
+        predictions_seq[model_name] = (seq_true, seq_pred, seq_prob, unique_test_seq_ids)
+
+    def record_seq(model_name, seq_true, seq_prob, seq_ids, val_true, val_prob):
+        """Record a model that natively predicts one row per sequence (the
+        sequence-level SVM/RF). Its sequence metrics are the model's true
+        granularity, so they populate both the sequence table and — for a
+        uniform 4-model comparison — the frame table."""
+        thr = (
+            best_threshold(val_true, val_prob[:, 1]) if config.tune_threshold else 0.5
+        )
+        seq_pred = (seq_prob[:, 1] >= thr).astype(int)
+        metrics = compute_metrics(seq_true, seq_pred, seq_prob)
+        results.append({"fold": fold_idx, "model": model_name, **metrics})
+        results_seq.append({"fold": fold_idx, "model": model_name, **metrics})
+        predictions[model_name] = (seq_true, seq_pred, seq_prob)
+        predictions_seq[model_name] = (seq_true, seq_pred, seq_prob, list(seq_ids))
 
     # --- ThermalCNN ---
     cnn_model = ThermalCNN(num_classes=config.num_classes, in_channels=config.in_channels)
@@ -427,41 +542,92 @@ def _train_and_evaluate_fold(
     # matches fold_splits["val"] and val_seq_ids).
     X_val_emb, y_val_emb = extract_cnn_embeddings(resnet_model, val_loader, device)
 
-    # Thermal-dynamics features (warming/cooling rate etc., see
-    # `compute_temporal_features`) concatenated to the embedding — the dataset
-    # is *dynamic* thermal imaging (DTI), but up to this point the pipeline
-    # treats every frame independently and never sees how temperature evolves
-    # across the sequence.
-    X_train_temporal = _temporal_feature_matrix(fold_splits["train"], temporal_features)
-    X_test_temporal = _temporal_feature_matrix(fold_splits["test"], temporal_features)
-    X_val_temporal = _temporal_feature_matrix(fold_splits["val"], temporal_features)
-
-    scaler = StandardScaler().fit(np.hstack([X_train_emb, X_train_temporal]))
-    X_train_full = scaler.transform(np.hstack([X_train_emb, X_train_temporal]))
-    X_test_full = scaler.transform(np.hstack([X_test_emb, X_test_temporal]))
-    X_val_full = scaler.transform(np.hstack([X_val_emb, X_val_temporal]))
-
+    # Assemble the classical feature matrices, either at sequence level (default,
+    # `classical_level="sequence"`) or per frame (`"frame"`, legacy). Thermal-
+    # dynamics features (warming/cooling rate etc., see
+    # `compute_temporal_features`) are concatenated to the embedding — the
+    # dataset is *dynamic* thermal imaging (DTI), so the classifier should see
+    # how temperature evolves across the sequence, which the frame embedding
+    # alone does not expose.
+    #
     # groups=patient_id (not patient_id+label) for the inner GroupKFold of the
-    # hyperparameter search: a patient contributes frames to both classes, so
-    # grouping by patient_id alone guarantees no frame from the same patient
-    # leaks between the inner search fold and its inner validation fold.
-    train_patient_ids = np.array([s["patient_id"] for s in fold_splits["train"]])
+    # hyperparameter search: a patient can contribute more than one sequence
+    # (and frames to both classes), so grouping by patient_id alone guarantees
+    # no sequence/frame from the same patient leaks between the inner search
+    # fold and its inner validation fold.
+    if config.classical_level == "sequence":
+        # One row per sequence: mean-pooled frame embedding ⊕ dynamics features.
+        # Matches the true unit of analysis (~168 sequences) and removes the
+        # near-duplicate-frame inflation of the per-frame path.
+        X_tr, y_tr, g_tr, _ = _pool_embeddings_by_sequence(
+            fold_splits["train"], X_train_emb, temporal_features, seq_pool=config.seq_pool,
+        )
+        X_te, y_te, g_te, te_seq_ids = _pool_embeddings_by_sequence(
+            fold_splits["test"], X_test_emb, temporal_features, seq_pool=config.seq_pool,
+        )
+        X_va, y_va, g_va, _ = _pool_embeddings_by_sequence(
+            fold_splits["val"], X_val_emb, temporal_features, seq_pool=config.seq_pool,
+        )
+    else:  # "frame" — legacy per-frame classification, pooled at prediction time
+        X_tr = np.hstack([X_train_emb, _temporal_feature_matrix(fold_splits["train"], temporal_features)])
+        X_te = np.hstack([X_test_emb, _temporal_feature_matrix(fold_splits["test"], temporal_features)])
+        X_va = np.hstack([X_val_emb, _temporal_feature_matrix(fold_splits["val"], temporal_features)])
+        y_tr, y_te, y_va = y_train_emb, y_test_emb, y_val_emb
+        g_tr = np.array([s["patient_id"] for s in fold_splits["train"]])
+
+    scaler = StandardScaler().fit(X_tr)
+    X_tr = scaler.transform(X_tr)
+    X_te = scaler.transform(X_te)
+    X_va = scaler.transform(X_va)
 
     svm = tune_svm(
-        X_train_full, y_train_emb, groups=train_patient_ids,
+        X_tr, y_tr, groups=g_tr,
         n_iter=config.svm_rf_tune_iter, cv=config.svm_rf_tune_cv,
     )
-    _, svm_prob = predict_classical(svm, X_test_full, n_classes=config.num_classes)
-    _, svm_val_prob = predict_classical(svm, X_val_full, n_classes=config.num_classes)
-    record("SVM", y_test_emb, svm_prob, y_val_emb, svm_val_prob)
+    _, svm_prob = predict_classical(svm, X_te, n_classes=config.num_classes)
+    _, svm_val_prob = predict_classical(svm, X_va, n_classes=config.num_classes)
 
     rf = tune_random_forest(
-        X_train_full, y_train_emb, groups=train_patient_ids,
+        X_tr, y_tr, groups=g_tr,
         n_iter=config.svm_rf_tune_iter, cv=config.svm_rf_tune_cv,
     )
-    _, rf_prob = predict_classical(rf, X_test_full, n_classes=config.num_classes)
-    _, rf_val_prob = predict_classical(rf, X_val_full, n_classes=config.num_classes)
-    record("Random Forest", y_test_emb, rf_prob, y_val_emb, rf_val_prob)
+    _, rf_prob = predict_classical(rf, X_te, n_classes=config.num_classes)
+    _, rf_val_prob = predict_classical(rf, X_va, n_classes=config.num_classes)
+
+    if config.classical_level == "sequence":
+        record_seq("SVM", y_te, svm_prob, te_seq_ids, y_va, svm_val_prob)
+        record_seq("Random Forest", y_te, rf_prob, te_seq_ids, y_va, rf_val_prob)
+    else:
+        record("SVM", y_te, svm_prob, y_va, svm_val_prob)
+        record("Random Forest", y_te, rf_prob, y_va, rf_val_prob)
+
+    # --- Ensemble: probability average of ResNet18 + SVM + Random Forest, at
+    # the sequence level. These three sit at indistinguishable AUCs but can err
+    # on different sequences, so averaging their per-sequence probabilities can
+    # firm up the estimate. Aligned by seq_id (each model's predictions_seq
+    # carries its own seq_id order); only sequences all three scored are kept.
+    if config.ensemble:
+        members = ["ResNet18", "SVM", "Random Forest"]
+        prob_by_id = {}  # seq_id -> {model -> P(class 1)}
+        true_by_id = {}
+        for m in members:
+            s_true, _, s_prob, s_ids = predictions_seq[m]
+            for sid, t, pr in zip(s_ids, s_true, s_prob):
+                prob_by_id.setdefault(sid, {})[m] = pr[1]
+                true_by_id[sid] = int(t)
+        ens_ids = [
+            sid for sid in predictions_seq["ResNet18"][3]
+            if len(prob_by_id.get(sid, {})) == len(members)
+        ]
+        if ens_ids:
+            p1 = np.array([np.mean([prob_by_id[sid][m] for m in members]) for sid in ens_ids])
+            ens_prob = np.column_stack([1.0 - p1, p1])
+            ens_true = np.array([true_by_id[sid] for sid in ens_ids])
+            ens_pred = (p1 >= 0.5).astype(int)
+            metrics = compute_metrics(ens_true, ens_pred, ens_prob)
+            results.append({"fold": fold_idx, "model": "Ensemble", **metrics})
+            results_seq.append({"fold": fold_idx, "model": "Ensemble", **metrics})
+            predictions_seq["Ensemble"] = (ens_true, ens_pred, ens_prob, ens_ids)
 
     logger.info("--- Fold %d concluido ---", fold_idx)
     for r, r_seq in zip(results, results_seq):
@@ -474,7 +640,7 @@ def _train_and_evaluate_fold(
         )
 
     return (
-        results, results_seq, predictions,
+        results, results_seq, predictions, predictions_seq,
         {"ThermalCNN": cnn_history, "ResNet18": resnet_history},
     )
 
@@ -484,12 +650,13 @@ def _save_outputs(
     all_results: list[dict],
     all_results_seq: list[dict],
     all_predictions: dict,
+    all_predictions_seq: dict,
     fold0_histories: dict,
 ) -> None:
     """Persist everything the analysis notebook needs, without requiring it
     to retrain anything: per-fold metrics (frame + patient level), pooled
-    test predictions per model, fold-0 training histories, and the config
-    used for this run."""
+    test predictions per model (frame level and sequence level), fold-0
+    training histories, and the config used for this run."""
     results_dir = config.results_dir
 
     folds_df = pd.DataFrame(all_results)
@@ -505,6 +672,21 @@ def _save_outputs(
         np.savez(
             results_dir / f"predictions_{FILE_SLUG[name]}.npz",
             y_true=y_true, y_pred=y_pred, y_prob=y_prob,
+        )
+
+    # Sequence-level pooled predictions (one row per sequence across all folds)
+    # — the honest unit of analysis, consumed by the notebook's pooled AUC +
+    # bootstrap-CI comparison. Includes the Ensemble when enabled.
+    for name in all_predictions_seq:
+        if not all_predictions_seq[name]["y_prob"]:
+            continue  # e.g. Ensemble produced nothing (no common sequences)
+        seq_true = np.array(all_predictions_seq[name]["y_true"])
+        seq_pred = np.array(all_predictions_seq[name]["y_pred"])
+        seq_prob = np.concatenate(all_predictions_seq[name]["y_prob"], axis=0)
+        seq_id = np.array(all_predictions_seq[name]["seq_id"])
+        np.savez(
+            results_dir / f"predictions_seq_{FILE_SLUG[name]}.npz",
+            y_true=seq_true, y_pred=seq_pred, y_prob=seq_prob, seq_id=seq_id,
         )
 
     for model_name, history in fold0_histories.items():
@@ -550,7 +732,9 @@ def run_cross_validation(config: TrainConfig, device: torch.device) -> None:
     # over the full dataset and reused across all folds — a fixed property of
     # each patient's own frames, independent of which fold uses it as
     # train/val/test.
-    temporal_features = compute_temporal_features(samples)
+    temporal_features = compute_temporal_features(
+        samples, roi=config.thermal_roi, feature_set=config.thermal_features,
+    )
 
     logger.info(
         "Total de amostras: %s | sequencias com features de dinamica termica: %s",
@@ -569,11 +753,15 @@ def run_cross_validation(config: TrainConfig, device: torch.device) -> None:
     all_results: list[dict] = []
     all_results_seq: list[dict] = []
     all_predictions = {name: {"y_true": [], "y_pred": [], "y_prob": []} for name in MODEL_NAMES}
+    seq_model_names = list(MODEL_NAMES) + (["Ensemble"] if config.ensemble else [])
+    all_predictions_seq = {
+        name: {"y_true": [], "y_pred": [], "y_prob": [], "seq_id": []} for name in seq_model_names
+    }
     fold0_histories: dict = {}
 
     for i, fold in enumerate(folds):
         logger.info("%s\nFOLD %d/%d\n%s", "=" * 70, i + 1, config.k_folds, "=" * 70)
-        results, results_seq, predictions, histories = _train_and_evaluate_fold(
+        results, results_seq, predictions, predictions_seq, histories = _train_and_evaluate_fold(
             fold, i, config, device, temporal_features,
         )
         all_results.extend(results)
@@ -582,8 +770,15 @@ def run_cross_validation(config: TrainConfig, device: torch.device) -> None:
             all_predictions[name]["y_true"].extend(np.asarray(y_true).tolist())
             all_predictions[name]["y_pred"].extend(np.asarray(y_pred).tolist())
             all_predictions[name]["y_prob"].append(np.asarray(y_prob))
+        for name, (s_true, s_pred, s_prob, s_ids) in predictions_seq.items():
+            all_predictions_seq[name]["y_true"].extend(np.asarray(s_true).tolist())
+            all_predictions_seq[name]["y_pred"].extend(np.asarray(s_pred).tolist())
+            all_predictions_seq[name]["y_prob"].append(np.asarray(s_prob))
+            all_predictions_seq[name]["seq_id"].extend(list(s_ids))
         if i == 0:
             fold0_histories = histories
 
-    _save_outputs(config, all_results, all_results_seq, all_predictions, fold0_histories)
+    _save_outputs(
+        config, all_results, all_results_seq, all_predictions, all_predictions_seq, fold0_histories,
+    )
     logger.info("Validacao cruzada concluida.")
